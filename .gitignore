@@ -1,0 +1,13 @@
+# model weights are fetched/bundled at build time, never committed
+assets/models/
+assets/silero_vad.onnx
+# build output
+dist/
+build/
+*.apk
+*.zip
+# secrets
+*.jks
+*.keystore
+.env
+get_ks_pass.sh

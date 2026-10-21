@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<automotiveApp>
+    <!-- Media app: shows up in the car's media source drawer. -->
+    <uses name="media" />
+    <!-- Template app (Car App Library): shows up as a pinnable icon in
+         Android Auto's Customize-launcher list. -->
+    <uses name="template" />
+</automotiveApp>

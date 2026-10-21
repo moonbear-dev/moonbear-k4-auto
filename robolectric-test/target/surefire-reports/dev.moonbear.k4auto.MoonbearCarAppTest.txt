@@ -1,0 +1,4 @@
+-------------------------------------------------------------------------------
+Test set: dev.moonbear.k4auto.MoonbearCarAppTest
+-------------------------------------------------------------------------------
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 9.017 s -- in dev.moonbear.k4auto.MoonbearCarAppTest
