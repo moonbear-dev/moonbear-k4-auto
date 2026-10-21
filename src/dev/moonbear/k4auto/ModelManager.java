@@ -57,7 +57,7 @@ public final class ModelManager {
     public static boolean ready(Context ctx) {
         for (String[] f : FILES) {
             File out = new File(dir(ctx, f[0]), f[1]);
-            if (!out.isFile() || out.length() < 1024) return false;
+            if (!out.isFile() || out.length() == 0) return false;   // tokens.txt is only 687 bytes
         }
         return true;
     }
