@@ -48,7 +48,7 @@ import java.util.concurrent.TimeUnit;
  * Voice service: probe a mic source that works, capture with Silero v6, stream Kokoro PCM back.
  *
  * This keeps the two behaviours the rewrite lost:
- *   - mic source probing (some sources init fine and return zeros under Android Auto)
+ *   - one mic-source probe per session (some sources init fine and return zeros under Android Auto)
  *   - a jitter-buffered player with silence fill, so sentence gaps don't underrun
  * and drops everything that never worked: barge-in, local TTS, espeak, MP3 fallback.
  */
@@ -63,7 +63,6 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
 
     public static final String CMD_START_LOOP = "start_loop";
     public static final String CMD_STOP = "stop";
-    public static final String CMD_REPLAY = "replay";
 
     public static final String STATE_IDLE = "IDLE";
     public static final String STATE_LISTENING = "LISTENING";
@@ -72,7 +71,7 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
 
     private static final int SAMPLE_RATE = 16000;
     private static final int PCM_RATE = 24000;
-    private static final int SILENCE_MS = 1400;  // give the speaker room to pause without losing the turn
+    private static final int SILENCE_MS = 1000;  // ~1s: enough for a thinking pause, still snappy
     private static final int MAX_TURN_MS = 60000;
     private static final int NO_SPEECH_MS = 15000;
     private static final float PREAMP = 4.0f;   // enough to lift the mic; higher clips and wrecks ASR
@@ -85,13 +84,10 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
     private MoonbearLocation location;
     private AudioManager audioManager;
     private MediaSessionCompat session;
-    private OnDeviceStt stt;
-    private OnDeviceTts tts;
-    private volatile boolean onDevice;
-    private static final int BEAR_SID = 0;   // kokoro voices.bin index
     private SileroVad vad;
 
     private volatile boolean running;
+    private int micSource;   // AudioRecord source that won the session probe; 0 = not probed yet
     private volatile android.media.AudioTrack streamTrack;
     private volatile boolean streamCancelled;
 
@@ -109,7 +105,6 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
     private String state = STATE_IDLE;
     private String headline = "Just talk";
     private String subline = "Listening over the Kia K4 mic";
-    private volatile String lastSpoken = "";
 
     // ------------------------------------------------------------------ lifecycle
 
@@ -128,6 +123,8 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
         });
         session.setActive(true);
         setSessionToken(session.getSessionToken());
+        // Set once: the title never changes, so the status path must not republish it.
+        publishMetadata("Moonbear");
     }
 
     @Override
@@ -165,9 +162,6 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
             case CMD_STOP:
                 stopEverything();
                 break;
-            case CMD_REPLAY:
-                replayLast();
-                break;
             default:
                 ensureListening();
         }
@@ -199,19 +193,6 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
         if (running) return;
         running = true;
         if (!location.hasUsableFix()) location.start();
-        if (ModelManager.ready(this) && stt == null && !onDevice) {
-            side.submit(() -> {
-                try {
-                    long t0 = android.os.SystemClock.elapsedRealtime();
-                    stt = new OnDeviceStt(this);
-                    tts = new OnDeviceTts(this);
-                    onDevice = true;
-                    report("on-device ready in " + (android.os.SystemClock.elapsedRealtime() - t0) + "ms");
-                } catch (Throwable t) {
-                    report("on-device init failed: " + t);
-                }
-            });
-        }
         turnThread = new Thread(this::turnLoop, "moonbear-turn");
         turnThread.setDaemon(true);
         turnThread.start();
@@ -220,104 +201,31 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
     private void turnLoop() {
         while (running) {
             try {
-                // no fallback: if the on-device engines are not loaded, say so and wait
-                if (stt == null || tts == null) {
-                    publish(STATE_IDLE, "Voice models missing", "On-device models not installed");
-                    sleep(2000);
-                    continue;
-                }
-
                 byte[] wav = captureTurn();
                 if (wav == null) continue;
 
                 publish(STATE_THINKING, "Thinking…", "moonbear is answering");
-
-                String heard = stt.transcribe(wavToFloats(wav), SAMPLE_RATE);
-                if (heard.isEmpty()) {
-                    publish(STATE_LISTENING, "Listening…", "Didn't catch that");
-                    continue;
-                }
-
-                JSONObject reply = sendText(heard);
+                JSONObject reply = send(wav);
                 if (reply == null) {
                     publish(STATE_LISTENING, "Listening…", "Bridge unreachable — retrying");
                     continue;
                 }
                 String spoken = reply.optString("reply", "");
-                if (spoken.isEmpty()) {
+                String pcmPath = reply.optString("pcm_path", "");
+                if (pcmPath.isEmpty()) {
                     publish(STATE_LISTENING, "Listening…", "Say that again");
                     continue;
                 }
-
-                lastSpoken = spoken;
-                publish(STATE_SPEAKING, spoken, "on-device voice");
-                playSamples(tts.say(spoken, BEAR_SID));
+                // A streamed turn returns pcm_path before the agent has finished
+                // writing the reply, so audio is the requirement and the text is
+                // optional: play the PCM and show a placeholder title for now.
+                publish(STATE_SPEAKING, spoken.isEmpty() ? "…" : spoken, "Kia K4 audio");
+                playPcm(pcmPath);
                 publish(STATE_LISTENING, "Listening…", "Just talk");
             } catch (Throwable t) {
                 Log.e(TAG, "turn failed", t);
                 publish(STATE_LISTENING, "Listening…", "Recovering");
             }
-        }
-    }
-
-    private void replayLast() {
-        final String text = lastSpoken;
-        if (text.isEmpty()) { ensureListening(); return; }
-        side.submit(() -> {
-            publish(STATE_SPEAKING, text, "on-device voice");
-            if (tts != null) playSamples(tts.say(text, BEAR_SID));
-            publish(STATE_LISTENING, "Listening…", "Just talk");
-        });
-    }
-
-    /** 16-bit PCM WAV -> mono floats; tolerates a standard 44-byte header. */
-    private float[] wavToFloats(byte[] wav) {
-        int off = 44;
-        if (wav.length < 48) return new float[0];
-        int n = (wav.length - off) / 2;
-        float[] out = new float[n];
-        for (int i = 0; i < n; i++) {
-            int lo = wav[off + i * 2] & 0xff;
-            int hi = wav[off + i * 2 + 1];
-            out[i] = ((short) ((hi << 8) | lo)) / 32768f;
-        }
-        return out;
-    }
-
-    /** Text-only turn: the phone has already transcribed and will speak locally. */
-    private JSONObject sendText(String text) {
-        try {
-            JSONObject body = new JSONObject();
-            body.put("text", text);
-            body.put("tts", "none");
-            body.put("voice", "bear");
-            body.put("mirror_discord", false);
-            java.text.SimpleDateFormat iso =
-                    new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", java.util.Locale.US);
-            java.util.TimeZone tz = java.util.TimeZone.getDefault();
-            iso.setTimeZone(tz);
-            body.put("device_time", iso.format(new java.util.Date()));
-            body.put("device_timezone", tz.getID());
-            if (location != null && location.hasUsableFix()) body.put("location", location.asJson());
-            String json = MoonbearHttp.callSigned(this, config.getServerUrl(),
-                    "/api/moonbear-voice/talk", "POST", body.toString(), 60_000);
-            return json == null ? null : new JSONObject(json);
-        } catch (Exception e) {
-            Log.e(TAG, "sendText failed", e);
-            return null;
-        }
-    }
-
-    private String streamPathFor(String text) {
-        try {
-            JSONObject body = new JSONObject();
-            body.put("text", text);
-            body.put("stream", true);
-            String json = MoonbearHttp.callSigned(this, config.getServerUrl(),
-                    "/api/moonbear-voice/talk", "POST", body.toString(), 60_000);
-            return json == null ? "" : new JSONObject(json).optString("pcm_path", "");
-        } catch (Exception e) {
-            return "";
         }
     }
 
@@ -331,52 +239,7 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
                 AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
         int bufferSize = Math.max(minBuf * 2, 8192);
 
-        int[] candidates = {
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                MediaRecorder.AudioSource.MIC
-        };
-        AudioRecord recorder = null;
-        int bestPeak = -1;
-        for (int src : candidates) {
-            AudioRecord probe = new AudioRecord(src, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT, bufferSize);
-            if (probe.getState() != AudioRecord.STATE_INITIALIZED) {
-                try { probe.release(); } catch (Exception ignored) {}
-                continue;
-            }
-            probe.startRecording();
-            short[] tmp = new short[SileroVad.WINDOW];
-            int peak = 0;
-            long until = System.currentTimeMillis() + 350;
-            while (System.currentTimeMillis() < until) {
-                int n = probe.read(tmp, 0, tmp.length);
-                if (n <= 0) continue;
-                for (int i = 0; i < n; i++) {
-                    int a = Math.abs((int) tmp[i]);
-                    if (a > peak) peak = a;
-                }
-            }
-            report("source=" + src + " peak=" + peak);
-            // pick the LOUDSET source, not the first that clears the floor:
-            // VOICE_COMMUNICATION often scrapes past it at peak ~25 while returning near-silence
-            if (peak > bestPeak) {
-                if (recorder != null) {
-                    try { recorder.stop(); } catch (Exception ignored) {}
-                    try { recorder.release(); } catch (Exception ignored) {}
-                }
-                recorder = probe;
-                bestPeak = peak;
-            } else {
-                try { probe.stop(); } catch (Exception ignored) {}
-                try { probe.release(); } catch (Exception ignored) {}
-            }
-        }
-        if (recorder != null && bestPeak <= 20) {
-            try { recorder.stop(); } catch (Exception ignored) {}
-            try { recorder.release(); } catch (Exception ignored) {}
-            recorder = null;
-        }
+        AudioRecord recorder = openRecorder(bufferSize);
         if (recorder == null) {
             publish(STATE_LISTENING, "Mic silent", "All mic sources returned zeros");
             return null;
@@ -439,14 +302,11 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
                     if (now - lastSpeech > SILENCE_MS) {
                         // anything under ~0.7s is a blip, not an utterance: sending it
                         // makes the recogniser invent a word out of noise
-                        if (out.size() < SAMPLE_RATE * 2 * 45 / 100) return null;   // 0.45s of audio
-                        if (speechFrames * SileroVad.WINDOW < SAMPLE_RATE * 15 / 100) return null;   // 0.15s of actual speech
-                        report("cap " + (out.size() / 2 * 1000 / SAMPLE_RATE) + "ms speech="
-                                + (speechFrames * SileroVad.WINDOW * 1000 / SAMPLE_RATE) + "ms");
+                        if (out.size() < SAMPLE_RATE * 2 * 25 / 100) return null;   // 0.25s of audio
+                        if (speechFrames * SileroVad.WINDOW < SAMPLE_RATE * 8 / 100) return null;    // 0.08s of actual speech
                         return wav(out.toByteArray());
                     }
                     if (now - started > MAX_TURN_MS) {
-                        report("cap hit max: " + out.size() / 2 + " frames, speech=" + speechFrames);
                         return wav(out.toByteArray());
                     }
                 }
@@ -458,6 +318,74 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
             try { recorder.release(); } catch (Exception ignored) {}
         }
         return null;
+    }
+
+    /**
+     * Open a recorder on the source that won this session's probe. A remembered
+     * source that no longer initialises is forgotten and probed once more.
+     */
+    private AudioRecord openRecorder(int bufferSize) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (micSource == 0) micSource = probeMicSource(bufferSize);
+            if (micSource == 0) return null;
+            AudioRecord recorder = new AudioRecord(micSource, SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize);
+            if (recorder.getState() == AudioRecord.STATE_INITIALIZED) {
+                recorder.startRecording();
+                return recorder;
+            }
+            try { recorder.release(); } catch (Exception ignored) {}
+            Log.w(TAG, "mic source " + micSource + " failed to init; probing again");
+            micSource = 0;
+        }
+        return null;
+    }
+
+    /**
+     * Probe the capture sources and remember the loudest one for the rest of the
+     * session. Some sources initialise fine and then return zeros under Android
+     * Auto, so the loudest wins rather than the first that clears the floor.
+     */
+    private int probeMicSource(int bufferSize) {
+        int[] candidates = {
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC
+        };
+        int bestSource = 0;
+        int bestPeak = -1;
+        for (int src : candidates) {
+            AudioRecord probe = new AudioRecord(src, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, bufferSize);
+            if (probe.getState() != AudioRecord.STATE_INITIALIZED) {
+                try { probe.release(); } catch (Exception ignored) {}
+                continue;
+            }
+            probe.startRecording();
+            short[] tmp = new short[SileroVad.WINDOW];
+            int peak = 0;
+            long until = System.currentTimeMillis() + 350;
+            while (System.currentTimeMillis() < until) {
+                int n = probe.read(tmp, 0, tmp.length);
+                if (n <= 0) continue;
+                for (int i = 0; i < n; i++) {
+                    int a = Math.abs((int) tmp[i]);
+                    if (a > peak) peak = a;
+                }
+            }
+            try { probe.stop(); } catch (Exception ignored) {}
+            try { probe.release(); } catch (Exception ignored) {}
+            if (peak > bestPeak) {
+                bestPeak = peak;
+                bestSource = src;
+            }
+        }
+        if (bestPeak <= 20) {
+            Log.w(TAG, "mic probe: no usable source (best peak " + bestPeak + ")");
+            return 0;
+        }
+        Log.i(TAG, "mic probe: source " + bestSource + " peak " + bestPeak);
+        return bestSource;
     }
 
     private void appendFrames(ByteArrayOutputStream out, float[] samples) {
@@ -501,6 +429,9 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
             JSONObject body = new JSONObject();
             body.put("audio_b64", android.util.Base64.encodeToString(wavBytes, android.util.Base64.NO_WRAP));
             body.put("stream", true);
+            // Tell the bridge this build tolerates an empty reply + early pcm_path
+            // (agent streaming). Older builds omit it and keep the classic turn.
+            body.put("agent_stream", true);
             body.put("mirror_discord", config.isMirrorDiscord());
             TimeZone tz = TimeZone.getDefault();
             SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US);
@@ -518,48 +449,12 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
     }
 
 
-    /** Short earcon, the way Siri/Assistant acknowledge you. Non-blocking. */
-    private void tone(final int freq, final int ms, final int amp) {
-        side.submit(() -> {
-            android.media.AudioTrack t = null;
-            try {
-                int n = PCM_RATE * ms / 1000;
-                short[] pcm = new short[n];
-                for (int i = 0; i < n; i++) {
-                    double fade = Math.min(1.0, Math.min(i, n - i) / (PCM_RATE * 0.008));
-                    pcm[i] = (short) (Math.sin(2 * Math.PI * freq * i / PCM_RATE) * amp * fade);
-                }
-                t = new android.media.AudioTrack.Builder()
-                        .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
-                        .setAudioFormat(new AudioFormat.Builder()
-                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                .setSampleRate(PCM_RATE)
-                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-                        .setBufferSizeInBytes(Math.max(n * 2, 4096))
-                        .setTransferMode(android.media.AudioTrack.MODE_STATIC)
-                        .build();
-                if (t.getState() != android.media.AudioTrack.STATE_INITIALIZED) return;
-                t.write(pcm, 0, n);
-                t.play();
-                sleep(ms + 60);
-            } catch (Throwable ignored) {
-            } finally {
-                if (t != null) {
-                    try { t.stop(); } catch (Exception ignored) {}
-                    try { t.release(); } catch (Exception ignored) {}
-                }
-            }
-        });
-    }
-
     /** Read the PCM stream on one thread, play it from a queue on another. */
     private void playPcm(String path) {
         if (path == null || path.isEmpty()) return;
         try {
             InputStream remote = MoonbearHttp.openSignedStream(this, config.getServerUrl(), path, 12_000, 60_000);
-            if (remote == null) { report("stream=null"); return; }
+            if (remote == null) { Log.w(TAG, "stream open returned null"); return; }
             playPcmStream(remote);
         } catch (Throwable t) {
             Log.e(TAG, "remote playback failed", t);
@@ -577,6 +472,35 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
             pcm[i * 2 + 1] = (byte) ((v >> 8) & 0xff);
         }
         playPcmStream(new java.io.ByteArrayInputStream(pcm));
+    }
+
+    /** Short earcon (assistant-style acknowledgement). Non-blocking. */
+    private void tone(final int freq, final int ms, final int amp) {
+        side.submit(() -> {
+            android.media.AudioTrack t = null;
+            try {
+                int n = PCM_RATE * ms / 1000;
+                short[] pcm = new short[n];
+                for (int i = 0; i < n; i++) {
+                    double fade = Math.min(1.0, Math.min(i, n - i) / (PCM_RATE * 0.008));
+                    pcm[i] = (short) (Math.sin(2 * Math.PI * freq * i / PCM_RATE) * amp * fade);
+                }
+                t = new android.media.AudioTrack(
+                        AudioManager.STREAM_MUSIC, PCM_RATE, AudioFormat.CHANNEL_OUT_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT, Math.max(n * 2, 8192),
+                        android.media.AudioTrack.MODE_STATIC);
+                if (t.getState() != android.media.AudioTrack.STATE_INITIALIZED) return;
+                t.write(pcm, 0, n);
+                t.play();
+                sleep(ms + 60);
+            } catch (Throwable ignored) {
+            } finally {
+                if (t != null) {
+                    try { t.stop(); } catch (Exception ignored) {}
+                    try { t.release(); } catch (Exception ignored) {}
+                }
+            }
+        });
     }
 
     private void playPcmStream(InputStream in) {
@@ -667,12 +591,8 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
             // the mixer still holds a few tens of ms after the last frame; stopping
             // immediately clips the final syllable
             sleep(250);
-            report("play=" + track.getPlayState() + " underruns=" + track.getUnderrunCount()
-                    + " written=" + written
-                    + " head=" + track.getPlaybackHeadPosition() + " frames=" + frames);
         } catch (Throwable t) {
             Log.e(TAG, "playback failed", t);
-            report("exception=" + t);
         } finally {
             if (in != null) try { in.close(); } catch (Exception ignored) {}
             if (track != null) {
@@ -733,7 +653,6 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
     private void publish(String newState, String head, String sub) {
         state = newState;
         headline = head;
-        publishMetadata(head);
         subline = sub;
         snapState = state;
         snapHeadline = headline;
@@ -752,21 +671,6 @@ public class MoonbearCarAudioService extends MediaBrowserServiceCompat {
         if (nm != null) {
             try { nm.notify(1, notification()); } catch (Exception ignored) {}
         }
-    }
-
-    /** One line to the bridge: mic source, playback state. No screenshots needed. */
-    private void report(String msg) {
-        try {
-            JSONObject body = new JSONObject();
-            body.put("debug", msg);
-            final String payload = body.toString();
-            side.submit(() -> {
-                try {
-                    MoonbearHttp.callSigned(this, config.getServerUrl(),
-                            "/api/moonbear-voice/debug", "POST", payload, 8_000);
-                } catch (Exception ignored) {}
-            });
-        } catch (Exception ignored) {}
     }
 
     private Bitmap art() {

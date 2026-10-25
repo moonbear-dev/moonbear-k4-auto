@@ -41,7 +41,7 @@ public final class SileroVad implements AutoCloseable {
                     assetName,
                     0.10f,              // threshold — floor-level; the car mic arrives very quiet
                     0.6f,               // minSilenceDuration (s) — don't close a segment on a short pause
-                    0.08f,              // minSpeechDuration (s) — a single syllable should count
+                    0.05f,              // minSpeechDuration (s) — a single syllable counts
                     WINDOW - 64,        // v5/v6 window_size (overlap is added back by sherpa)
                     20.0f               // maxSpeechDuration (s)
             );

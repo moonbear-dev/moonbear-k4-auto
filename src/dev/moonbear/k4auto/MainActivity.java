@@ -58,30 +58,24 @@ public class MainActivity extends Activity {
         }
     };
 
-    /** First run: fetch the on-device models automatically, no tap required. */
-    private void maybeOfferModelDownload() {
-        if (ModelManager.ready(this)) return;
-        downloading = true;
-        sublineView.setText("Fetching on-device voice models (~740 MB, one time)…");
-        new Thread(() -> {
-            ModelManager.ensureModels(this, MoonbearConfig.DEFAULT_SERVER_URL, new ModelManager.Progress() {
-                @Override public void onProgress(String file, long done, long total) {
-                    if ((done & 0xFFFFF) < 0x40000) return;   // don't spam the UI
-                    runOnUiThread(() -> sublineView.setText(
-                            file + "  " + (done >> 20) + " / " + (total >> 20) + " MB"));
-                }
-                @Override public void onDone(boolean ok, String error) {
-                    downloading = false;
-                    runOnUiThread(() -> sublineView.setText(ok
-                            ? "On-device voice ready — reopen the app"
-                            : "Model download failed: " + error));
-                }
-            });
-        }).start();
+    private void installCrashHandler() {
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((thread, ex) -> {
+            try {
+                java.io.FileWriter w = new java.io.FileWriter(
+                        new java.io.File(getFilesDir(), "engine.crash"));
+                java.io.PrintWriter pw = new java.io.PrintWriter(w);
+                ex.printStackTrace(pw);
+                pw.close();
+            } catch (Throwable ignored) {
+            }
+            if (prev != null) prev.uncaughtException(thread, ex);
+        });
     }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        installCrashHandler();
         super.onCreate(savedInstanceState);
         config = new MoonbearConfig(this);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -89,7 +83,6 @@ public class MainActivity extends Activity {
             getWindow().setNavigationBarColor(Color.parseColor("#0B0F17"));
         }
         setContentView(buildUi());
-        maybeOfferModelDownload();
         requestNeededPermissions();
         applyState();
     }

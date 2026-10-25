@@ -29,8 +29,8 @@ echo "[2/6] Linking resources and generating R.java..."
   --java "$BUILD_DIR/gen" \
   --min-sdk-version 26 \
   --target-sdk-version 35 \
-  --version-code 90 \
-  --version-name "5.0.0-k4gt" \
+  --version-code 106 \
+  --version-name "7.1.0-k4gt" \
   -A "$PROJECT_DIR/assets" \
   -o "$BUILD_DIR/unaligned.apk" \
   "$BUILD_DIR/compiled_res/res.zip"
